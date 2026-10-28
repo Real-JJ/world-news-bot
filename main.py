@@ -7,7 +7,7 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from statistics import mean, median
+from statistics import mean
 from zoneinfo import ZoneInfo
 
 import requests
@@ -23,7 +23,6 @@ TETHER_STATE_FILE = Path("tether_state.json")
 MAX_NEWS_PER_RUN = 1
 TEHRAN = ZoneInfo("Asia/Tehran")
 TETHER_ALERT_THRESHOLD_TOMAN = 5000
-TETHER_REPORT_HOURS = {0, 12}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; WorldNewsBot/1.0)"
@@ -101,6 +100,8 @@ ROUTINE_STATEMENT_WORDS = [
 ]
 
 
+# -------------------- متن و ترجمه --------------------
+
 def clean_text(value):
     if not value:
         return ""
@@ -110,18 +111,9 @@ def clean_text(value):
     ).get_text(" ", strip=True)
 
     value = html.unescape(value)
-
-    # حذف آیدی کانال تلگرام
-    value = re.sub(
-        r"(?<!\w)@[A-Za-z][A-Za-z0-9_]{3,}",
-        "",
-        value
-    )
-
+    value = re.sub(r"(?<!\w)@[A-Za-z][A-Za-z0-9_]{3,}", "", value)
     value = re.sub(r"\s+", " ", value).strip()
     value = re.sub(r"[\s|•·—–\-]+$", "", value).strip()
-
-    # حذف امضای خنده در انتهای پست
     value = re.sub(r"\s*😁\s*$", "", value).strip()
 
     return value
@@ -136,6 +128,119 @@ def contains_any(text, words):
     return any(word in text for word in words)
 
 
+def validate_translation(result, original):
+    result = clean_text(html.unescape(str(result or "")))
+    result = re.sub(
+        r"^(?:ترجمه(?:ٔ|ی)?\s*:\s*|Persian translation\s*:\s*)",
+        "",
+        result,
+        flags=re.I
+    ).strip(" \"'“”‘’")
+
+    if not result or not is_persian(result):
+        return None
+
+    if result.lower() == original.strip().lower():
+        return None
+
+    return result
+
+
+def translate_with_dg_ai(text):
+    """Unofficial free endpoint; availability and response schema may change."""
+    prompt = (
+        "Translate this news text from English into accurate, natural Persian (Farsi). "
+        "Preserve names, numbers, dates and facts. Do not summarize or explain. "
+        "Return only the Persian translation:\n\n" + text[:1800]
+    )
+
+    response = requests.post(
+        "https://dg-ai.scriptsnsenses.workers.dev/v1/chat",
+        headers={"Content-Type": "application/json", **HEADERS},
+        json={
+            "model": "gpt-oss",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Translate English news into Persian. Return only the translation."
+                },
+                {"role": "user", "content": prompt}
+            ]
+        },
+        timeout=25
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    result = data.get("reply", "")
+    if not result and data.get("choices"):
+        result = data["choices"][0].get("message", {}).get("content", "")
+
+    result = validate_translation(result, text)
+    if not result:
+        raise ValueError("No valid Persian translation returned")
+
+    return result
+
+
+def translate_with_llmfaucet(text):
+    """Unofficial/free model gateway; endpoint and free models may change."""
+    prompt = (
+        "Translate this news text from English into accurate, natural Persian (Farsi). "
+        "Preserve names, numbers, dates and facts. Do not summarize. "
+        "Return only the Persian translation:\n\n" + text[:1800]
+    )
+
+    response = requests.post(
+        "https://api.llmfaucet.dev/v1/chat/completions",
+        headers={"Content-Type": "application/json", **HEADERS},
+        json={
+            "model": "auto",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an accurate English-to-Persian news translator. Output only the translation."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 900
+        },
+        timeout=30
+    )
+    response.raise_for_status()
+    data = response.json()
+    result = data["choices"][0]["message"]["content"]
+
+    result = validate_translation(result, text)
+    if not result:
+        raise ValueError("No valid Persian translation returned")
+
+    return result
+
+
+def translate_with_mymemory(text):
+    response = requests.get(
+        "https://api.mymemory.translated.net/get",
+        params={"q": text[:450], "langpair": "en|fa"},
+        headers=HEADERS,
+        timeout=20
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if str(data.get("responseStatus")) != "200":
+        raise ValueError(data.get("responseDetails", "MyMemory failed"))
+
+    result = data.get("responseData", {}).get("translatedText", "")
+    result = validate_translation(result, text)
+
+    if not result:
+        raise ValueError("No valid Persian translation returned")
+
+    return result
+
+
 def translate_to_persian(value):
     value = clean_text(value)
 
@@ -145,6 +250,24 @@ def translate_to_persian(value):
     if is_persian(value):
         return value
 
+    # اول هوش مصنوعی، سپس مترجم معمولی رایگان.
+    # این endpointهای غیررسمی هنوز باید در Actions آزمایش شوند.
+    providers = [
+        ("DG AI", translate_with_dg_ai),
+        ("LLM Faucet", translate_with_llmfaucet),
+        ("MyMemory", translate_with_mymemory),
+    ]
+
+    for name, translator in providers:
+        try:
+            result = translator(value)
+            if result:
+                logging.info("Translation succeeded: %s", name)
+                return result
+        except Exception as exc:
+            logging.warning("%s translation failed: %s", name, exc)
+
+    # Google Translate آخرین گزینه است.
     for attempt in range(2):
         try:
             if attempt:
@@ -155,24 +278,28 @@ def translate_to_persian(value):
                 target="fa"
             ).translate(value)
 
-            if result and result.strip():
-                return clean_text(result)
+            result = validate_translation(result, value)
+
+            if result:
+                logging.info("Translation succeeded: Google Translate (last resort)")
+                return result
+
+            raise ValueError("No valid Persian translation returned")
 
         except Exception as exc:
             logging.warning(
-                "Translation attempt %s failed: %s",
+                "Google Translate attempt %s failed: %s",
                 attempt + 1, exc
             )
 
-    # در صورت شکست ترجمه، خبر انگلیسی منتشر نمی‌شود.
+    # هرگز متن انگلیسی را به‌جای ترجمه منتشر نکن.
     return None
 
 
+# -------------------- فیلتر و اولویت اخبار --------------------
+
 def parse_date(entry):
-    parsed = (
-        entry.get("published_parsed")
-        or entry.get("updated_parsed")
-    )
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
 
     if parsed:
         try:
@@ -186,13 +313,9 @@ def parse_date(entry):
 def is_important_news(text, published):
     age = datetime.now(timezone.utc) - published
 
-    if age > timedelta(hours=72):
+    if age > timedelta(hours=72) or age < timedelta(minutes=-10):
         return False
 
-    if age < timedelta(minutes=-10):
-        return False
-
-    # اخبار رضا پهلوی و آزادی‌خواهی اولویت دارند.
     if contains_any(text, PAHLAVI_WORDS):
         return True
 
@@ -202,7 +325,6 @@ def is_important_news(text, published):
     iran_related = contains_any(text, IRAN_WORDS)
     iran_event = contains_any(text, IRAN_EVENT_WORDS)
 
-    # اظهارات عادی مقامات بدون رویداد مهم منتشر نشوند.
     if (
         iran_related
         and contains_any(text, ROUTINE_STATEMENT_WORDS)
@@ -217,10 +339,7 @@ def is_important_news(text, published):
 
 
 def category_for(text):
-    if contains_any(text, PAHLAVI_WORDS):
-        return "👑🦁"
-
-    if contains_any(text, FREEDOM_WORDS):
+    if contains_any(text, PAHLAVI_WORDS + FREEDOM_WORDS):
         return "👑🦁"
 
     if contains_any(text, IRAN_WORDS):
@@ -237,7 +356,6 @@ def priority_for(text, published):
         0,
         (datetime.now(timezone.utc) - published).total_seconds() / 3600
     )
-
     freshness = max(0, 72 - int(age_hours))
 
     if contains_any(text, PAHLAVI_WORDS):
@@ -255,39 +373,33 @@ def priority_for(text, published):
     return 100 + freshness
 
 
+# -------------------- جمع‌آوری RSS و تلگرام --------------------
+
 def extract_feed_image(entry):
     for field in ("media_content", "media_thumbnail"):
         items = entry.get(field, [])
-
         if isinstance(items, dict):
             items = [items]
 
         for item in items:
             url = item.get("url")
-
             if url and url.startswith("http"):
                 return url
 
     for enclosure in entry.get("enclosures", []):
         url = enclosure.get("href") or enclosure.get("url")
-
         if (
-            url
-            and url.startswith("http")
+            url and url.startswith("http")
             and enclosure.get("type", "").startswith("image/")
         ):
             return url
 
     for field in ("summary", "description"):
-        soup = BeautifulSoup(
-            entry.get(field, ""), "html.parser"
-        )
-
+        soup = BeautifulSoup(entry.get(field, ""), "html.parser")
         image = soup.find("img")
 
         if image:
             url = image.get("src") or image.get("data-src")
-
             if url and url.startswith("http"):
                 return url
 
@@ -299,13 +411,8 @@ def collect_rss():
 
     for source, feed_url in FEEDS:
         try:
-            response = requests.get(
-                feed_url,
-                headers=HEADERS,
-                timeout=20
-            )
+            response = requests.get(feed_url, headers=HEADERS, timeout=20)
             response.raise_for_status()
-
             parsed = feedparser.parse(response.content)
 
             for entry in parsed.entries[:30]:
@@ -316,13 +423,12 @@ def collect_rss():
                     continue
 
                 summary = clean_text(
-                    entry.get("summary", "")
-                    or entry.get("description", "")
+                    entry.get("summary", "") or entry.get("description", "")
                 )
-
                 published = parse_date(entry)
-                combined = f"{title} {summary}"
-                priority = priority_for(combined, published)
+                priority = priority_for(
+                    f"{title} {summary}", published
+                )
 
                 if priority <= 0:
                     continue
@@ -338,16 +444,10 @@ def collect_rss():
                     "priority": priority,
                 })
 
-            logging.info(
-                "%s: collected %s entries",
-                source, len(parsed.entries)
-            )
+            logging.info("%s: collected %s entries", source, len(parsed.entries))
 
         except Exception as exc:
-            logging.warning(
-                "RSS failed (%s): %s",
-                source, exc
-            )
+            logging.warning("RSS failed (%s): %s", source, exc)
 
     return news
 
@@ -363,85 +463,53 @@ def collect_telegram():
                 timeout=20
             )
             response.raise_for_status()
-
             soup = BeautifulSoup(response.text, "html.parser")
 
             for post in soup.select(".tgme_widget_message_wrap"):
-                message = post.select_one(
-                    ".tgme_widget_message_text"
-                )
-
+                message = post.select_one(".tgme_widget_message_text")
                 if not message:
                     continue
 
-                text = clean_text(
-                    message.get_text(" ", strip=True)
-                )
-
+                text = clean_text(message.get_text(" ", strip=True))
                 if len(text) < 20:
                     continue
 
-                date_link = post.select_one(
-                    "a.tgme_widget_message_date"
-                )
-
-                link = (
-                    date_link.get("href", "")
-                    if date_link else ""
-                )
+                date_link = post.select_one("a.tgme_widget_message_date")
+                link = date_link.get("href", "") if date_link else ""
 
                 if not link:
                     data_post = post.select_one("[data-post]")
-
                     if data_post:
-                        link = (
-                            "https://t.me/"
-                            + data_post.get("data-post", "")
-                        )
+                        link = "https://t.me/" + data_post.get("data-post", "")
 
                 if not link:
                     continue
 
                 published = datetime.now(timezone.utc)
-
                 if date_link:
                     time_element = date_link.select_one("time")
-
-                    if (
-                        time_element
-                        and time_element.get("datetime")
-                    ):
+                    if time_element and time_element.get("datetime"):
                         try:
                             published = datetime.fromisoformat(
-                                time_element["datetime"].replace(
-                                    "Z", "+00:00"
-                                )
+                                time_element["datetime"].replace("Z", "+00:00")
                             )
-
                             if published.tzinfo is None:
-                                published = published.replace(
-                                    tzinfo=timezone.utc
-                                )
-
+                                published = published.replace(tzinfo=timezone.utc)
                         except Exception:
                             pass
 
                 priority = priority_for(text, published)
-
                 if priority <= 0:
                     continue
 
                 image_url = None
-                photo = post.select_one(
-                    ".tgme_widget_message_photo_wrap"
-                )
+                photo = post.select_one(".tgme_widget_message_photo_wrap")
 
                 if photo:
                     match = re.search(
                         r"""background-image:\s*url\(['"]?(.*?)['"]?\)""",
                         photo.get("style", "")
                     )
-
                     if match:
                         image_url = match.group(1)
 
@@ -457,13 +525,12 @@ def collect_telegram():
                 })
 
         except Exception as exc:
-            logging.warning(
-                "Telegram channel failed (%s): %s",
-                channel, exc
-            )
+            logging.warning("Telegram channel failed (%s): %s", channel, exc)
 
     return news
 
+
+# -------------------- ارسال تلگرام --------------------
 
 def send_text(text):
     response = requests.post(
@@ -475,7 +542,6 @@ def send_text(text):
         },
         timeout=30
     )
-
     response.raise_for_status()
 
     if not response.json().get("ok"):
@@ -492,7 +558,6 @@ def send_photo(image_url, caption):
         },
         timeout=40
     )
-
     response.raise_for_status()
 
     if not response.json().get("ok"):
@@ -503,59 +568,44 @@ def format_news(item):
     raw_title = clean_text(item["title"])
     raw_summary = clean_text(item.get("summary", ""))
 
-    # حذف تکرار تیتر در ابتدای پست‌های تلگرامی
     if raw_summary.startswith(raw_title):
-        raw_summary = raw_summary[len(raw_title):].lstrip(
-            " :-—–|"
-        )
+        raw_summary = raw_summary[len(raw_title):].lstrip(" :-—–|")
 
     title = translate_to_persian(raw_title)
 
     if not title:
-        logging.warning(
-            "Skipping story: title translation failed (%s)",
-            item["source"]
-        )
+        logging.warning("Skipping story: title translation failed (%s)", item["source"])
         return None
 
     summary = ""
-
     if raw_summary and raw_summary.lower() != raw_title.lower():
         translated = translate_to_persian(raw_summary[:700])
-
         if translated:
-            summary = re.sub(
-                r"\s+", " ", translated
-            ).strip()
+            summary = re.sub(r"\s+", " ", translated).strip()[:210]
 
-    title = re.sub(r"\s+", " ", title).strip()
-    title = title[:150].rstrip()
-
-    summary = summary[:210].rstrip()
+    title = re.sub(r"\s+", " ", title).strip()[:150].rstrip()
 
     if summary.lower().startswith(title.lower()):
         summary = summary[len(title):].lstrip(" :—–-")
 
     emoji = category_for(raw_title + " " + raw_summary)
-
     body = f"{emoji} {title}"
 
     if summary:
         body += f"\n{summary}"
 
-    return f"{body}\n\n📰 منبع: {item['source']}"[:900]
+    # لینک منبع نیز در پیام قرار می‌گیرد.
+    return f"{body}\n\n📰 منبع: {item['source']}\n🔗 {item['link']}"[:1000]
 
+
+# -------------------- تاریخچه خبرها --------------------
 
 def load_seen():
     try:
         if SEEN_FILE.exists():
-            data = json.loads(
-                SEEN_FILE.read_text(encoding="utf-8")
-            )
-
+            data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 return set(str(item) for item in data)
-
     except Exception as exc:
         logging.warning("Could not read seen.json: %s", exc)
 
@@ -564,47 +614,31 @@ def load_seen():
 
 def save_seen(seen):
     SEEN_FILE.write_text(
-        json.dumps(
-            list(seen)[-10000:],
-            ensure_ascii=False,
-            indent=2
-        ),
+        json.dumps(list(seen)[-10000:], ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
 
 
+# -------------------- قیمت تتر --------------------
+
 def load_tether_state():
     try:
         if TETHER_STATE_FILE.exists():
-            data = json.loads(
-                TETHER_STATE_FILE.read_text(encoding="utf-8")
-            )
-
+            data = json.loads(TETHER_STATE_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 data.setdefault("history", [])
                 data.setdefault("last_report_slot", "")
                 data.setdefault("alert_active", False)
                 return data
-
     except Exception as exc:
-        logging.warning(
-            "Could not read tether_state.json: %s", exc
-        )
+        logging.warning("Could not read tether_state.json: %s", exc)
 
-    return {
-        "history": [],
-        "last_report_slot": "",
-        "alert_active": False
-    }
+    return {"history": [], "last_report_slot": "", "alert_active": False}
 
 
 def save_tether_state(state):
     TETHER_STATE_FILE.write_text(
-        json.dumps(
-            state,
-            ensure_ascii=False,
-            indent=2
-        ),
+        json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
 
@@ -612,41 +646,32 @@ def save_tether_state(state):
 def fetch_tether_prices():
     prices = {}
 
-    # نوبیتکس: بازار USDT/IRT با واحد ریال
-    try:
-        response = requests.get(
-            "https://apiv2.nobitex.ir/v3/orderbook/USDTIRT",
-            headers=HEADERS,
-            timeout=15
-        )
-        response.raise_for_status()
+    # Nobitex: معمولاً قیمت بازار IRT به ریال است؛ برای تومان تقسیم بر ۱۰.
+    for endpoint in [
+        "https://apiv2.nobitex.ir/v3/orderbook/USDTIRT",
+        "https://api.nobitex.ir/v3/orderbook/USDTIRT",
+        "https://api.nobitex.net/v3/orderbook/USDTIRT",
+    ]:
+        try:
+            response = requests.get(endpoint, headers=HEADERS, timeout=12)
+            response.raise_for_status()
+            data = response.json()
 
-        data = response.json()
-
-        if data.get("status") == "ok":
             raw = data.get("lastTradePrice")
-
-            if (
-                not raw
-                and data.get("asks")
-                and data.get("bids")
-            ):
+            if not raw and data.get("asks") and data.get("bids"):
                 raw = (
-                    float(data["asks"][0][0])
-                    + float(data["bids"][0][0])
+                    float(data["asks"][0][0]) + float(data["bids"][0][0])
                 ) / 2
 
             value = float(raw) / 10 if raw else 0
-
             if value > 0:
                 prices["نوبیتکس"] = value
+                break
 
-    except Exception as exc:
-        logging.warning(
-            "Nobitex price unavailable: %s", exc
-        )
+        except Exception as exc:
+            logging.warning("Nobitex endpoint failed: %s", exc)
 
-    # والکس: تلاش برای دریافت بازار USDT/IRT یا USDT/IRR
+    # Wallex schema can change; accept only a recognized USDT/IRT market.
     try:
         response = requests.get(
             "https://api.wallex.ir/v1/markets",
@@ -654,14 +679,9 @@ def fetch_tether_prices():
             timeout=15
         )
         response.raise_for_status()
-
         data = response.json()
         result = data.get("result", {})
-        markets = (
-            result.get("markets", result)
-            if isinstance(result, dict)
-            else result
-        )
+        markets = result.get("markets", result) if isinstance(result, dict) else result
 
         if isinstance(markets, dict):
             market_items = markets.values()
@@ -674,48 +694,29 @@ def fetch_tether_prices():
             if not isinstance(market, dict):
                 continue
 
-            symbol = str(
-                market.get("symbol", market.get("market", ""))
-            ).upper()
+            symbol = str(market.get("symbol", market.get("market", ""))).upper()
+            base = str(market.get("baseAsset", "")).upper()
+            quote = str(market.get("quoteAsset", "")).upper()
+            compact = symbol.replace("-", "").replace("_", "")
 
-            base = str(
-                market.get("baseAsset", "")
-            ).upper()
-
-            quote = str(
-                market.get("quoteAsset", "")
-            ).upper()
-
-            compact_symbol = symbol.replace("-", "").replace("_", "")
-
-            is_tether_irt = (
-                compact_symbol in {"USDTIRT", "USDTIRR"}
-                or (
-                    base == "USDT"
-                    and quote in {"IRT", "IRR"}
-                )
+            is_usdt_irt = (
+                compact in {"USDTIRT", "USDTIRR"}
+                or (base == "USDT" and quote in {"IRT", "IRR"})
             )
-
-            if not is_tether_irt:
+            if not is_usdt_irt:
                 continue
 
             stats = market.get("stats", {}) or {}
-
             raw = (
                 stats.get("lastPrice")
                 or market.get("lastPrice")
                 or market.get("price")
             )
-
             if not raw:
                 continue
 
             value = float(raw)
-
-            if (
-                quote in {"IRT", "IRR"}
-                or compact_symbol.endswith(("IRT", "IRR"))
-            ):
+            if quote in {"IRT", "IRR"} or compact.endswith(("IRT", "IRR")):
                 value /= 10
 
             if value > 0:
@@ -723,30 +724,19 @@ def fetch_tether_prices():
                 break
 
     except Exception as exc:
-        logging.warning(
-            "Wallex price unavailable: %s", exc
-        )
+        logging.warning("Wallex price unavailable: %s", exc)
 
     return prices
 
 
 def format_toman(value):
     digits = f"{int(round(value)):,}"
-
-    return digits.translate(
-        str.maketrans(
-            "0123456789",
-            "۰۱۲۳۴۵۶۷۸۹"
-        )
-    )
+    return digits.translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 
 def tether_price_message(prices, average_price, change=None):
     if len(prices) > 1:
-        source_line = (
-            f"میانگین {len(prices)} صرافی: "
-            + "، ".join(prices.keys())
-        )
+        source_line = "میانگین صرافی‌ها: " + "، ".join(prices.keys())
     else:
         source_line = "منبع: " + next(iter(prices.keys()))
 
@@ -758,9 +748,8 @@ def tether_price_message(prices, average_price, change=None):
 
     if change is not None:
         sign = "+" if change >= 0 else "−"
-
         message += (
-            f"\n📊 تغییر ۲۴ ساعته: {sign}"
+            f"\n📊 تغییر حدود ۲۴ ساعته: {sign}"
             f"{format_toman(abs(change))} تومان"
         )
 
@@ -771,138 +760,84 @@ def check_tether_price():
     state = load_tether_state()
     now = datetime.now(timezone.utc)
     local_now = now.astimezone(TEHRAN)
-
     prices = fetch_tether_prices()
 
     if not prices:
-        logging.warning(
-            "No tether prices available from supported exchanges."
-        )
+        logging.warning("No tether prices available.")
         return
 
-    values = list(prices.values())
-
-    if len(values) >= 3:
-        center = median(values)
-
-        filtered = {
-            name: price
-            for name, price in prices.items()
-            if abs(price - center) / center <= 0.05
-        }
-
-        if filtered:
-            prices = filtered
-            values = list(prices.values())
-
-    current_price = mean(values)
-
+    current_price = mean(prices.values())
     history = []
 
     for item in state.get("history", []):
         try:
-            timestamp = datetime.fromisoformat(
-                item["timestamp"]
-            )
-
+            timestamp = datetime.fromisoformat(item["timestamp"])
             if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(
-                    tzinfo=timezone.utc
-                )
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
 
             if now - timestamp <= timedelta(hours=30):
                 history.append({
                     "timestamp": timestamp.isoformat(),
                     "price": float(item["price"])
                 })
-
         except Exception:
             continue
 
     reference = None
-
     for item in history:
-        timestamp = datetime.fromisoformat(
-            item["timestamp"]
-        )
-
+        timestamp = datetime.fromisoformat(item["timestamp"])
         age = now - timestamp
 
         if timedelta(hours=23) <= age <= timedelta(hours=25):
-            distance = abs(
-                age.total_seconds() - 24 * 3600
-            )
-
+            distance = abs(age.total_seconds() - 24 * 3600)
             if reference is None or distance < reference[0]:
                 reference = (distance, item["price"])
 
-    change_24h = (
-        current_price - reference[1]
-        if reference else None
-    )
+    change_24h = current_price - reference[1] if reference else None
 
     history.append({
         "timestamp": now.isoformat(),
         "price": round(current_price, 2)
     })
-
     state["history"] = history[-220:]
 
-    # یک هشدار برای هر جهش پیوسته؛ بعد از افت، دوباره آماده هشدار می‌شود.
     if change_24h is not None:
-        above_threshold = (
-            change_24h >= TETHER_ALERT_THRESHOLD_TOMAN
-        )
+        above_threshold = change_24h >= TETHER_ALERT_THRESHOLD_TOMAN
 
         if above_threshold and not state.get("alert_active", False):
             send_text(
                 "🚨 هشدار افزایش قیمت تتر\n"
-                + tether_price_message(
-                    prices, current_price, change_24h
-                )
-                + "\n⚠️ افزایش بیش از ۵٬۰۰۰ تومان نسبت به حدود ۲۴ ساعت قبل."
+                + tether_price_message(prices, current_price, change_24h)
+                + "\n⚠️ افزایش حداقل ۵٬۰۰۰ تومان نسبت به حدود ۲۴ ساعت قبل."
             )
-
             state["alert_active"] = True
 
         elif not above_threshold:
             state["alert_active"] = False
 
-    # اولین اجرای هر بازه ده‌دقیقه‌ای در ساعت ۰۰ یا ۱۲ تهران
-    if (
-        local_now.hour in TETHER_REPORT_HOURS
-        and local_now.minute < 10
-    ):
-        slot = (
-            f"{local_now.date().isoformat()}-"
-            f"{local_now.hour:02d}"
-        )
+    # گزارش در ساعت ۰۰ و ۱۲ تهران، در اولین اجرای ده‌دقیقه‌ای آن ساعت.
+    if local_now.hour in {0, 12} and local_now.minute < 10:
+        slot = f"{local_now.date().isoformat()}-{local_now.hour:02d}"
 
         if state.get("last_report_slot") != slot:
-            send_text(
-                tether_price_message(
-                    prices, current_price, change_24h
-                )
-            )
-
+            send_text(tether_price_message(prices, current_price, change_24h))
             state["last_report_slot"] = slot
 
     save_tether_state(state)
 
 
+# -------------------- اجرای اصلی --------------------
+
 def main():
-    # بررسی قیمت تتر در هر اجرا
     try:
         check_tether_price()
     except Exception:
         logging.exception("Tether check failed")
 
     seen = load_seen()
-
     candidates = collect_rss() + collect_telegram()
 
     unique = {}
-
     for item in candidates:
         if item["id"] not in seen:
             unique[item["id"]] = item
@@ -915,14 +850,10 @@ def main():
     if not candidates:
         logging.info("No new important stories found.")
         save_seen(seen)
-        save_tether_state(load_tether_state())
         return
 
     candidates.sort(
-        key=lambda item: (
-            item["priority"],
-            item["published"].timestamp()
-        ),
+        key=lambda item: (item["priority"], item["published"].timestamp()),
         reverse=True
     )
 
@@ -934,14 +865,13 @@ def main():
             break
 
         if translation_failures >= 3:
-            logging.warning(
-                "Too many translation failures; ending this run."
-            )
+            logging.warning("Too many translation failures; ending this run.")
             break
 
         message = format_news(item)
 
         if not message:
+            # خبر در seen.json ثبت نمی‌شود؛ اجرای بعدی دوباره امتحانش می‌کند.
             translation_failures += 1
             continue
 
@@ -950,29 +880,19 @@ def main():
                 try:
                     send_photo(item["image"], message)
                 except Exception as exc:
-                    logging.warning(
-                        "Photo failed; trying text instead: %s",
-                        exc
-                    )
+                    logging.warning("Photo failed; trying text: %s", exc)
                     send_text(message)
             else:
                 send_text(message)
 
             seen.add(item["id"])
             published_count += 1
-
-            logging.info(
-                "Published: %s",
-                item["title"][:100]
-            )
+            logging.info("Published: %s", item["title"][:100])
 
         except Exception as exc:
-            logging.error(
-                "Could not publish story: %s", exc
-            )
+            logging.error("Could not publish story: %s", exc)
 
     save_seen(seen)
-    save_tether_state(load_tether_state())
 
 
 if __name__ == "__main__":
