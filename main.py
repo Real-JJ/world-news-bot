@@ -1,5 +1,3 @@
-
-from daily_messages import check_daily_messages
 import os
 import re
 import json
@@ -15,6 +13,9 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
+
+from daily_messages import check_daily_messages
+
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -293,7 +294,7 @@ def translate_to_persian(value):
                 attempt + 1, exc
             )
 
-    # هرگز متن انگلیسی را به‌جای ترجمه منتشر نکن.
+    # اگر همهٔ مترجم‌ها شکست خوردند، خبر را منتشر نمی‌کنیم.
     return None
 
 
@@ -633,6 +634,7 @@ def format_news(item):
 
     return body + footer
 
+
 # -------------------- تاریخچه خبرها --------------------
 
 def load_seen():
@@ -864,6 +866,13 @@ def check_tether_price():
 # -------------------- اجرای اصلی --------------------
 
 def main():
+    # پیام تاریخ و شعر ساعت ۷ و مناسبت‌های غیرمذهبی ساعت ۱۰
+    try:
+        check_daily_messages(send_text)
+    except Exception:
+        logging.exception("Daily messages check failed")
+
+    # بررسی قیمت تتر؛ ادامهٔ ربات حتی در صورت خطای این بخش
     try:
         check_tether_price()
     except Exception:
