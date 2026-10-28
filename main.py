@@ -1,4 +1,5 @@
 
+from daily_messages import check_daily_messages
 import os
 import re
 import json
