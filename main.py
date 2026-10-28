@@ -58,12 +58,28 @@ IRAN_WORDS = [
 ]
 
 
+
 def clean_text(value):
     if not value:
         return ""
+
     value = BeautifulSoup(str(value), "html.parser").get_text(" ", strip=True)
     value = html.unescape(value)
-    return re.sub(r"\s+", " ", value).strip()
+
+    # حذف آیدی کانال‌های تلگرام، مثل @Pm_Afshaa
+    value = re.sub(
+        r"(?<!\w)@[A-Za-z][A-Za-z0-9_]{3,}",
+        "",
+        value
+    )
+
+    # مرتب‌سازی فاصله‌ها
+    value = re.sub(r"\s+", " ", value).strip()
+
+    # حذف جداکننده‌ها و ایموجی‌های اضافی انتهای خبر
+    value = re.sub(r"[\s|•·—–\-]+$", "", value).strip()
+
+    return value
 
 
 def is_persian(value):
