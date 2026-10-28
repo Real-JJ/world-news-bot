@@ -564,6 +564,30 @@ def send_photo(image_url, caption):
         raise RuntimeError("Telegram could not send the photo")
 
 
+def short_complete_summary(value, max_chars=280, max_sentences=2):
+    value = re.sub(r"\s+", " ", clean_text(value)).strip()
+    if not value:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?؟۔])(?:\s+|$)", value)
+    kept = []
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        candidate = " ".join(kept + [sentence])
+        if len(candidate) > max_chars:
+            break
+
+        kept.append(sentence)
+        if len(kept) >= max_sentences:
+            break
+
+    return " ".join(kept).strip()
+
+
 def format_news(item):
     raw_title = clean_text(item["title"])
     raw_summary = clean_text(item.get("summary", ""))
@@ -572,21 +596,24 @@ def format_news(item):
         raw_summary = raw_summary[len(raw_title):].lstrip(" :-—–|")
 
     title = translate_to_persian(raw_title)
-
     if not title:
-        logging.warning("Skipping story: title translation failed (%s)", item["source"])
+        logging.warning(
+            "Skipping story: title translation failed (%s)",
+            item["source"]
+        )
         return None
 
+    title = re.sub(r"\s+", " ", title).strip()
     summary = ""
+
     if raw_summary and raw_summary.lower() != raw_title.lower():
         translated = translate_to_persian(raw_summary[:700])
         if translated:
-            summary = re.sub(r"\s+", " ", translated).strip()[:210]
-
-    title = re.sub(r"\s+", " ", title).strip()[:150].rstrip()
+            summary = short_complete_summary(translated)
 
     if summary.lower().startswith(title.lower()):
         summary = summary[len(title):].lstrip(" :—–-")
+        summary = short_complete_summary(summary)
 
     emoji = category_for(raw_title + " " + raw_summary)
     body = f"{emoji} {title}"
@@ -594,9 +621,16 @@ def format_news(item):
     if summary:
         body += f"\n{summary}"
 
-    # لینک منبع نیز در پیام قرار می‌گیرد.
-    return f"{body}\n\n📰 منبع: {item['source']}\n🔗 {item['link']}"[:1000]
+    footer = f"\n\n📰 منبع: {item['source']}\n🔗 {item['link']}"
+    max_body = 1024 - len(footer)
 
+    if len(body) > max_body:
+        body = f"{emoji} {title}"
+
+    if len(body) > max_body:
+        body = body[:max_body].rsplit(" ", 1)[0].rstrip()
+
+    return body + footer
 
 # -------------------- تاریخچه خبرها --------------------
 
