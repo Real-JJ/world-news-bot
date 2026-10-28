@@ -1,13 +1,17 @@
-
 import os
 import re
 import html
+import json
 import requests
 import feedparser
+from pathlib import Path
 from deep_translator import GoogleTranslator
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+SEEN_FILE = Path("seen.json")
+MAX_NEWS_PER_RUN = 4
 
 FEEDS = [
     "https://feeds.bbci.co.uk/persian/rss.xml",
@@ -17,21 +21,35 @@ FEEDS = [
 translator = GoogleTranslator(source="auto", target="fa")
 
 
-def translate(text):
+def clean_text(text):
     text = re.sub(r"<[^>]+>", " ", text or "")
-    text = html.unescape(text).strip()
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def translate(text):
+    text = clean_text(text)
+
     if not text:
         return ""
+
+    # Avoid retranslating text that already contains Persian.
+    if re.search(r"[\u0600-\u06FF]", text):
+        return text
+
     try:
         return translator.translate(text[:4000]) or text
-    except Exception:
+    except Exception as error:
+        print("Translation error:", error)
         return text
 
 
 def category(text):
+    text = text.lower()
+
     rules = {
         "⚔️ جنگ و امنیت": [
-            "war", "attack", "missile", "military", "iran",
+            "war", "attack", "missile", "military",
             "جنگ", "حمله", "موشک", "ارتش", "امنیت"
         ],
         "🏛 سیاست": [
@@ -39,26 +57,44 @@ def category(text):
             "سیاست", "رئیس‌جمهور", "انتخابات", "دولت"
         ],
         "💰 اقتصاد": [
-            "economy", "market", "oil", "trade", "اقتصاد",
-            "بازار", "نفت", "تجارت", "تورم"
+            "economy", "market", "oil", "trade",
+            "اقتصاد", "بازار", "نفت", "تجارت", "تورم"
         ],
         "💻 فناوری": [
-            "technology", "artificial intelligence", "AI",
-            "تکنولوژی", "فناوری", "هوش مصنوعی"
+            "technology", "artificial intelligence",
+            "software", "فناوری", "تکنولوژی", "هوش مصنوعی"
         ],
     }
 
-    text = text.lower()
     for name, words in rules.items():
         if any(word in text for word in words):
             return name
+
     return "🌍 اخبار جهان"
 
 
-def send_message(text):
-    url = (
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def load_seen():
+    if not SEEN_FILE.exists():
+        return []
+
+    try:
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_seen(seen):
+    # Keep the most recent 2000 links.
+    SEEN_FILE.write_text(
+        json.dumps(seen[-2000:], ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
+
+
+def send_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
     response = requests.post(
         url,
         json={
@@ -69,35 +105,46 @@ def send_message(text):
         timeout=30,
     )
     response.raise_for_status()
+
     result = response.json()
     if not result.get("ok"):
-        raise RuntimeError("Telegram rejected the message")
+        raise RuntimeError(f"Telegram error: {result}")
 
 
 def main():
-    news = []
+    seen = load_seen()
+    seen_set = set(seen)
+    candidates = []
 
     for feed_url in FEEDS:
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:10]:
+
+            if getattr(feed, "bozo", False):
+                print("Feed warning:", feed_url)
+
+            for entry in feed.entries:
                 link = entry.get("link", "").strip()
-                title = entry.get("title", "").strip()
+                title = clean_text(entry.get("title", ""))
 
-                if link and title:
-                    news.append((title, link, entry))
+                if link and title and link not in seen_set:
+                    candidates.append((title, link, entry))
         except Exception as error:
-            print("Feed error:", error)
+            print("Feed error:", feed_url, error)
 
-    # Avoid duplicates within this single run.
+    # Remove duplicate links from the current batch.
     unique = {}
-    for title, link, entry in news:
+    for title, link, entry in candidates:
         unique.setdefault(link, (title, link, entry))
 
-    for title, link, entry in list(unique.values())[:4]:
-        original = title + " " + entry.get("summary", "")
+    published = 0
+
+    for title, link, entry in list(unique.values())[:MAX_NEWS_PER_RUN]:
+        original_summary = clean_text(entry.get("summary", ""))
+        original = f"{title} {original_summary}"
+
         translated_title = translate(title)
-        summary = translate(entry.get("summary", ""))
+        summary = translate(original_summary)
 
         if len(summary) > 650:
             summary = summary[:647].rsplit(" ", 1)[0] + "..."
@@ -112,9 +159,15 @@ def main():
 
         try:
             send_message(message)
+            seen.append(link)
+            seen_set.add(link)
+            published += 1
             print("Published:", link)
         except Exception as error:
             print("Publish error:", error)
+
+    save_seen(seen)
+    print(f"Finished. Published {published} new stories.")
 
 
 if __name__ == "__main__":
