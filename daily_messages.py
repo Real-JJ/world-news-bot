@@ -243,7 +243,6 @@ def check_daily_messages(send_text):
     # پیام ساعت ۷ صبح: تاریخ‌ها و شعر
     if (
         now.hour == 7
-        and now.minute < 10
         and state.get("date_message") != today
     ):
         jy, jm, jd = gregorian_to_jalali(
@@ -289,7 +288,6 @@ def check_daily_messages(send_text):
     # پیام ساعت ۱۰ صبح: فقط مناسبت سکولار ثبت‌شده
     if (
         now.hour == 10
-        and now.minute < 10
         and state.get("occasion_message") != today
     ):
         occasion = SECULAR_OCCASIONS.get(
