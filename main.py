@@ -7,17 +7,12 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin
 
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 
-
-# =========================
-# Configuration
-# =========================
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -34,7 +29,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s"
 )
 
-# RSS news sources
 FEEDS = [
     ("ایران اینترنشنال", "https://www.iranintl.com/feed"),
     ("رادیو فردا", "https://www.radiofarda.com/api/zpoqil-vomx-tpe_kip"),
@@ -47,15 +41,9 @@ FEEDS = [
     ("نیویورک تایمز", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"),
 ]
 
-# Public Telegram channels
 TELEGRAM_CHANNELS = [
     ("منوتو", "ManotoTV"),
     ("PMTV News", "Pm_Afshaa"),
-]
-
-IRAN_WORDS = [
-    "iran", "iranian", "tehran", "persian",
-    "ایران", "ایرانی", "تهران", "جمهوری اسلامی"
 ]
 
 PAHLAVI_WORDS = [
@@ -64,12 +52,11 @@ PAHLAVI_WORDS = [
     "شاهزاده", "خاندان پهلوی"
 ]
 
-TRANSLATOR = GoogleTranslator(source="auto", target="fa")
+IRAN_WORDS = [
+    "iran", "iranian", "tehran", "persian",
+    "ایران", "ایرانی", "تهران", "جمهوری اسلامی"
+]
 
-
-# =========================
-# Helpers
-# =========================
 
 def clean_text(value):
     if not value:
@@ -79,20 +66,43 @@ def clean_text(value):
     return re.sub(r"\s+", " ", value).strip()
 
 
+def is_persian(value):
+    return bool(re.search(r"[\u0600-\u06FF]", value or ""))
+
+
 def translate_to_persian(value):
     value = clean_text(value)
+
     if not value:
         return ""
 
-    # Keep text that already contains Persian characters.
-    if re.search(r"[\u0600-\u06FF]", value):
+    # Don't send Persian text to the translator unnecessarily.
+    if is_persian(value):
         return value
 
-    try:
-        return TRANSLATOR.translate(value) or value
-    except Exception as exc:
-        logging.warning("Translation failed: %s", exc)
-        return value
+    # Retry temporary translation failures.
+    for attempt in range(3):
+        try:
+            if attempt:
+                time.sleep(4 * attempt)
+
+            result = GoogleTranslator(
+                source="auto",
+                target="fa"
+            ).translate(value)
+
+            if result and result.strip():
+                time.sleep(2)
+                return result.strip()
+
+        except Exception as exc:
+            logging.warning(
+                "Translation attempt %s failed: %s",
+                attempt + 1, exc
+            )
+
+    # IMPORTANT: Never silently publish untranslated English.
+    return None
 
 
 def load_seen():
@@ -108,10 +118,8 @@ def load_seen():
 
 
 def save_seen(seen):
-    # Keep the history from growing without limit.
-    items = list(seen)[-10000:]
     SEEN_FILE.write_text(
-        json.dumps(items, ensure_ascii=False, indent=2),
+        json.dumps(list(seen)[-10000:], ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
 
@@ -141,15 +149,12 @@ def extract_feed_image(entry):
 
     for enclosure in entry.get("enclosures", []):
         url = enclosure.get("href") or enclosure.get("url")
-        kind = enclosure.get("type", "")
-        if url and (kind.startswith("image/") or not kind):
-            if url.startswith("http"):
+        if url and url.startswith("http"):
+            if enclosure.get("type", "").startswith("image/"):
                 return url
 
-    # Some feeds put the image inside their summary HTML.
     for field in ("summary", "description"):
-        raw = entry.get(field, "")
-        soup = BeautifulSoup(raw, "html.parser")
+        soup = BeautifulSoup(entry.get(field, ""), "html.parser")
         image = soup.find("img")
         if image:
             url = image.get("src") or image.get("data-src")
@@ -166,11 +171,17 @@ def category_for(text):
         return "👑"
     if any(word in lower for word in IRAN_WORDS):
         return "🇮🇷"
-    if any(word in lower for word in ["war", "attack", "missile", "جنگ", "حمله", "موشک"]):
+    if any(word in lower for word in [
+        "war", "attack", "missile", "جنگ", "حمله", "موشک"
+    ]):
         return "🚨"
-    if any(word in lower for word in ["economy", "market", "business", "اقتصاد", "بازار"]):
+    if any(word in lower for word in [
+        "economy", "market", "business", "اقتصاد", "بازار"
+    ]):
         return "📊"
-    if any(word in lower for word in ["election", "president", "انتخابات", "رئیس‌جمهور"]):
+    if any(word in lower for word in [
+        "election", "president", "انتخابات", "رئیس‌جمهور"
+    ]):
         return "🗳️"
 
     return "🌍"
@@ -180,20 +191,14 @@ def priority_for(text, published):
     lower = text.lower()
     age = datetime.now(timezone.utc) - published
 
-    # Old stories should not jump ahead just because they mention Pahlavi.
-    recent = age <= timedelta(days=7)
-
-    if recent and any(word in lower for word in PAHLAVI_WORDS):
-        return 100
-    if recent and any(word in lower for word in IRAN_WORDS):
-        return 50
+    if age <= timedelta(days=7):
+        if any(word in lower for word in PAHLAVI_WORDS):
+            return 100
+        if any(word in lower for word in IRAN_WORDS):
+            return 50
 
     return 10
 
-
-# =========================
-# RSS collection
-# =========================
 
 def collect_rss():
     news = []
@@ -204,7 +209,6 @@ def collect_rss():
                 feed_url, headers=HEADERS, timeout=20
             )
             response.raise_for_status()
-
             parsed = feedparser.parse(response.content)
 
             for entry in parsed.entries[:30]:
@@ -215,7 +219,8 @@ def collect_rss():
                     continue
 
                 summary = clean_text(
-                    entry.get("summary", "") or entry.get("description", "")
+                    entry.get("summary", "")
+                    or entry.get("description", "")
                 )
 
                 published = parse_date(entry)
@@ -232,7 +237,10 @@ def collect_rss():
                     "priority": priority_for(combined, published),
                 })
 
-            logging.info("%s: collected %s entries", source, len(parsed.entries))
+            logging.info(
+                "%s: collected %s entries",
+                source, len(parsed.entries)
+            )
 
         except Exception as exc:
             logging.warning("RSS failed (%s): %s", source, exc)
@@ -240,26 +248,21 @@ def collect_rss():
     return news
 
 
-# =========================
-# Public Telegram collection
-# =========================
-
 def collect_telegram():
     news = []
 
     for source, channel in TELEGRAM_CHANNELS:
-        page_url = f"https://t.me/s/{channel}"
-
         try:
             response = requests.get(
-                page_url, headers=HEADERS, timeout=20
+                f"https://t.me/s/{channel}",
+                headers=HEADERS,
+                timeout=20
             )
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, "html.parser")
-            posts = soup.select(".tgme_widget_message_wrap")
 
-            for post in posts:
+            for post in soup.select(".tgme_widget_message_wrap"):
                 message = post.select_one(".tgme_widget_message_text")
                 if not message:
                     continue
@@ -280,6 +283,7 @@ def collect_telegram():
                     continue
 
                 published = datetime.now(timezone.utc)
+
                 if date_link:
                     time_element = date_link.select_one("time")
                     if time_element and time_element.get("datetime"):
@@ -288,7 +292,9 @@ def collect_telegram():
                                 time_element["datetime"].replace("Z", "+00:00")
                             )
                             if published.tzinfo is None:
-                                published = published.replace(tzinfo=timezone.utc)
+                                published = published.replace(
+                                    tzinfo=timezone.utc
+                                )
                         except Exception:
                             pass
 
@@ -296,15 +302,12 @@ def collect_telegram():
                 photo = post.select_one(".tgme_widget_message_photo_wrap")
 
                 if photo:
-                    style = photo.get("style", "")
                     match = re.search(
                         r"""background-image:\s*url\(['"]?(.*?)['"]?\)""",
-                        style
+                        photo.get("style", "")
                     )
                     if match:
                         image_url = match.group(1)
-
-                combined = text
 
                 news.append({
                     "id": link,
@@ -314,81 +317,86 @@ def collect_telegram():
                     "link": link,
                     "image": image_url,
                     "published": published,
-                    "priority": priority_for(combined, published),
+                    "priority": priority_for(text, published),
                 })
 
         except Exception as exc:
-            logging.warning("Telegram channel failed (%s): %s", channel, exc)
+            logging.warning(
+                "Telegram channel failed (%s): %s", channel, exc
+            )
 
     return news
 
 
-# =========================
-# Telegram publishing
-# =========================
-
 def send_text(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     response = requests.post(
-        url,
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         data={
             "chat_id": CHAT_ID,
             "text": text,
             "disable_web_page_preview": True,
         },
-        timeout=30,
+        timeout=30
     )
     response.raise_for_status()
 
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram sendMessage failed: {result}")
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram could not send the message")
 
 
 def send_photo(image_url, caption):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-
     response = requests.post(
-        url,
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
         data={
             "chat_id": CHAT_ID,
             "photo": image_url,
             "caption": caption[:1024],
         },
-        timeout=40,
+        timeout=40
     )
     response.raise_for_status()
 
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram sendPhoto failed: {result}")
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram could not send the photo")
 
 
 def format_news(item):
-    original = f"{item['title']} {item['summary']}".strip()
-
     title = translate_to_persian(item["title"])
-    summary = translate_to_persian(item["summary"])
 
-    # Avoid repeating the title if the summary already starts with it.
-    if summary and summary.startswith(title):
-        body = summary
-    elif summary:
-        body = f"{title}\n\n{summary}"
+    if not title:
+        logging.warning(
+            "Skipping story: title translation failed (%s)",
+            item["source"]
+        )
+        return None
+
+    summary = item["summary"][:1200]
+
+    if summary:
+        translated_summary = translate_to_persian(summary)
+
+        if not translated_summary:
+            logging.warning(
+                "Skipping story: summary translation failed (%s)",
+                item["source"]
+            )
+            return None
+    else:
+        translated_summary = ""
+
+    if translated_summary and translated_summary.startswith(title):
+        body = translated_summary
+    elif translated_summary:
+        body = f"{title}\n\n{translated_summary}"
     else:
         body = title
 
-    emoji = category_for(original)
-    source = item["source"]
+    emoji = category_for(item["title"] + " " + item["summary"])
+    message = f"{emoji} {body}\n\n📰 منبع: {item['source']}"
 
-    # Intentionally do not display the article URL.
-    return f"{emoji} {body}\n\n📰 منبع: {source}"
+    # Keep photo captions within Telegram's caption limit.
+    return message[:1000]
 
-
-# =========================
-# Main
-# =========================
 
 def main():
     seen = load_seen()
@@ -396,12 +404,10 @@ def main():
     candidates = collect_rss()
     candidates.extend(collect_telegram())
 
-    # Remove duplicates and previously published items.
     unique = {}
     for item in candidates:
-        if item["id"] in seen:
-            continue
-        unique[item["id"]] = item
+        if item["id"] not in seen:
+            unique[item["id"]] = item
 
     candidates = list(unique.values())
 
@@ -410,35 +416,45 @@ def main():
         save_seen(seen)
         return
 
-    # Prefer recent Pahlavi-related news, then Iran-related news,
-    # while using publication time to select the newest within each tier.
     candidates.sort(
         key=lambda item: (
             item["priority"],
             item["published"].timestamp()
         ),
-        reverse=True,
+        reverse=True
     )
 
     published_count = 0
+    translation_failures = 0
 
+    # Try several stories if translation fails for the first one.
     for item in candidates:
         if published_count >= MAX_NEWS_PER_RUN:
             break
 
-        caption = format_news(item)
+        if translation_failures >= 3:
+            logging.warning(
+                "Too many translation failures; ending this run."
+            )
+            break
+
+        message = format_news(item)
+
+        if not message:
+            translation_failures += 1
+            continue
 
         try:
             if item.get("image"):
                 try:
-                    send_photo(item["image"], caption)
+                    send_photo(item["image"], message)
                 except Exception as exc:
                     logging.warning(
-                        "Photo failed; sending text instead: %s", exc
+                        "Photo failed; trying text instead: %s", exc
                     )
-                    send_text(caption)
+                    send_text(message)
             else:
-                send_text(caption)
+                send_text(message)
 
             seen.add(item["id"])
             published_count += 1
