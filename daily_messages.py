@@ -288,19 +288,13 @@ def check_daily_messages(send_text):
     # پیام ساعت ۱۰ صبح: فقط مناسبت سکولار ثبت‌شده
     if (
         now.hour == 10
-        and state.get("occasion_message") != today
-    ):
-        occasion = SECULAR_OCCASIONS.get(
-            (now.month, now.day)
-        )
+        and if occasion:
+title, description = occasion
+send_text(
+f"🗓 مناسبت امروز: {title}\n\n{description}"
+)
+logging.info("Daily occasion sent: %s", today)
 
-        # حتی در روزهای بدون مناسبت، بررسی امروز را ثبت می‌کنیم.
-        state["occasion_message"] = today
-        save_daily_state(state)
-
-        if occasion:
-            title, description = occasion
-            send_text(
-                f"🗓 مناسبت امروز: {title}\n\n{description}"
-            )
-            logging.info("Daily occasion sent: %s", today)
+    # فقط بعد از ارسال موفق یا بررسی روز بدون مناسبت، ثبت می‌کنیم.
+    state["occasion_message"] = today
+    save_daily_state(state)
