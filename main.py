@@ -11,7 +11,7 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SEEN_FILE = Path("seen.json")
-MAX_NEWS_PER_RUN = 4
+MAX_NEWS_PER_RUN = 1
 
 FEEDS = [
     "https://feeds.bbci.co.uk/persian/rss.xml",
