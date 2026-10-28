@@ -172,40 +172,44 @@ def gregorian_to_jalali(gy, gm, gd):
         31, 31, 30, 31, 30, 31,
     ]
 
-    gy2 = gy + 1 if gm > 2 else gy
+    gy2 = gy - 1600
+    gm2 = gm - 1
+    gd2 = gd - 1
 
-    days = (
-        365 * gy
+    g_day_no = (
+        365 * gy2
         + (gy2 + 3) // 4
         - (gy2 + 99) // 100
         + (gy2 + 399) // 400
-        - 80
-        + gd
     )
 
-    days += sum(g_days_in_month[:gm - 1])
+    g_day_no += sum(g_days_in_month[:gm2])
 
     if gm > 2 and (
-        gy % 4 == 0 and (gy % 100 != 0 or gy % 400 == 0)
+        gy % 4 == 0
+        and (gy % 100 != 0 or gy % 400 == 0)
     ):
-        days += 1
+        g_day_no += 1
 
-    jy = -1595 + 33 * (days // 12053)
-    days %= 12053
+    g_day_no += gd2
 
-    jy += 4 * (days // 1461)
-    days %= 1461
+    j_day_no = g_day_no - 79
+    j_np = j_day_no // 12053
+    j_day_no %= 12053
 
-    if days > 365:
-        jy += (days - 1) // 365
-        days = (days - 1) % 365
+    jy = 979 + 33 * j_np + 4 * (j_day_no // 1461)
+    j_day_no %= 1461
 
-    if days < 186:
-        jm = 1 + days // 31
-        jd = 1 + days % 31
+    if j_day_no >= 366:
+        jy += (j_day_no - 1) // 365
+        j_day_no = (j_day_no - 1) % 365
+
+    if j_day_no < 186:
+        jm = 1 + j_day_no // 31
+        jd = 1 + j_day_no % 31
     else:
-        jm = 7 + (days - 186) // 30
-        jd = 1 + (days - 186) % 30
+        jm = 7 + (j_day_no - 186) // 30
+        jd = 1 + (j_day_no - 186) % 30
 
     return jy, jm, jd
 
