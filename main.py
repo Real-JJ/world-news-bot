@@ -79,6 +79,11 @@ def clean_text(value):
     # حذف جداکننده‌ها و ایموجی‌های اضافی انتهای خبر
     value = re.sub(r"[\s|•·—–\-]+$", "", value).strip()
 
+
+    # حذف ایموجی خنده‌ای که به انتهای پست اضافه شده
+    value = re.sub(r"\s*😁\s*$", "", value).strip()
+
+    
     return value
 
 
